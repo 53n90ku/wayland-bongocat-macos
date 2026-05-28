@@ -5,6 +5,12 @@
 
 set -euo pipefail
 
+if ! command -v xxd >/dev/null 2>&1; then
+    echo "ERROR: xxd is required but not found." >&2
+    echo "Install it with your package manager (e.g. 'pacman -S xxd', 'apt install xxd', 'dnf install vim-common')." >&2
+    exit 1
+fi
+
 ASSETS_DIR="assets/new"
 OUTPUT_DIR="include/graphics"
 OUTPUT_FILE="$OUTPUT_DIR/embedded_assets.h"

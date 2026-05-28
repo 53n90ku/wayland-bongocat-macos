@@ -85,6 +85,11 @@ $(TARGET): $(OBJECTS) $(PROTOCOL_OBJECTS)
 # The generated files are committed to git, so this target only needs to be run
 # manually when the protocol XML sources are updated.
 protocols:
+	@command -v wayland-scanner >/dev/null 2>&1 || { \
+		echo "ERROR: wayland-scanner not found."; \
+		echo "Install it with your package manager (e.g. 'pacman -S wayland', 'apt install libwayland-bin')."; \
+		exit 1; \
+	}
 	wayland-scanner client-header $(PROTOCOLDIR)/xdg-shell.xml $(PROTOCOLDIR)/xdg-shell-client-protocol.h
 	wayland-scanner private-code $(PROTOCOLDIR)/xdg-shell.xml $(PROTOCOLDIR)/xdg-shell-protocol.c
 	wayland-scanner private-code $(PROTOCOLDIR)/wlr-layer-shell-unstable-v1.xml $(PROTOCOLDIR)/zwlr-layer-shell-v1-protocol.c

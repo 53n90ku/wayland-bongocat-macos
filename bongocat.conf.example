@@ -1,8 +1,8 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# BONGO CAT CONFIG - Default Configuration
+# BONGO CAT CONFIG - macOS Default Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 # Save this file to: ~/.config/bongocat/bongocat.conf
-# Run with: bongocat --watch-config
+# Run with: ./build/bongocat --watch-config
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -39,21 +39,21 @@ overlay_position=top
 layer=top
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
-# │ INPUT DEVICES                                                               │
+# │ INPUT MONITORING                                                            │
 # └─────────────────────────────────────────────────────────────────────────────┘
 
-# Find your device with: bongocat-find-devices
-# Add multiple lines for multiple keyboards
-keyboard_device=/dev/input/event4
+# macOS uses global keyboard events after Input Monitoring permission is
+# granted in System Settings > Privacy & Security > Input Monitoring.
+# keyboard_device and keyboard_name are not needed on macOS.
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
 # │ MULTI-MONITOR (optional)                                                    │
 # └─────────────────────────────────────────────────────────────────────────────┘
 
 # Leave commented to auto-detect
-# Find monitor names with: wlr-randr or hyprctl monitors
-# monitor=eDP-1
-# monitor=eDP-1,HDMI-A-1
+# Use the display names shown in System Settings > Displays.
+# monitor=Built-in Retina Display
+# monitor=Built-in Retina Display,Studio Display
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
 # │ ANIMATION                                                                   │
@@ -87,10 +87,10 @@ sleep_end=06:00
 # disable_fullscreen_hide=0
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
-# │ HOTPLUG                                                                     │
+# │ INPUT RESCAN                                                                │
 # └─────────────────────────────────────────────────────────────────────────────┘
 
-# How often to rescan for new input devices, in seconds (0=scan once at startup)
+# Ignored by the macOS backend; kept for config compatibility.
 # hotplug_scan_interval=30
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐

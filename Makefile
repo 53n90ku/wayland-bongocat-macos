@@ -1,5 +1,10 @@
 # Compiler
-CC = gcc
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    CC = clang
+else
+    CC = gcc
+endif
 
 # Build type (debug or release)
 BUILD_TYPE ?= release
@@ -19,13 +24,24 @@ DEBUG_LDFLAGS = -fsanitize=address -fsanitize=undefined
 # Release flags
 RELEASE_CFLAGS = $(BASE_CFLAGS) -O3 -DNDEBUG -flto -fPIE -D_FORTIFY_SOURCE=2
 
-# Set flags based on build type
-ifeq ($(BUILD_TYPE),debug)
-    CFLAGS = $(DEBUG_CFLAGS)
-    LDFLAGS = -lwayland-client -lm -lpthread $(DEBUG_LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+    BASE_CFLAGS += -Wno-unknown-warning-option -Wno-nullability-completeness
+    OBJCFLAGS = -fobjc-arc -fblocks
+    ifeq ($(BUILD_TYPE),debug)
+        CFLAGS = $(DEBUG_CFLAGS) $(OBJCFLAGS)
+        LDFLAGS = -lm -lpthread -framework Cocoa -framework ApplicationServices -framework Carbon $(DEBUG_LDFLAGS)
+    else
+        CFLAGS = $(BASE_CFLAGS) -O3 -DNDEBUG -D_FORTIFY_SOURCE=2 $(OBJCFLAGS)
+        LDFLAGS = -lm -lpthread -framework Cocoa -framework ApplicationServices -framework Carbon
+    endif
 else
-    CFLAGS = $(RELEASE_CFLAGS)
-    LDFLAGS = -lwayland-client -lm -lpthread -flto -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+    ifeq ($(BUILD_TYPE),debug)
+        CFLAGS = $(DEBUG_CFLAGS)
+        LDFLAGS = -lwayland-client -lm -lpthread $(DEBUG_LDFLAGS)
+    else
+        CFLAGS = $(RELEASE_CFLAGS)
+        LDFLAGS = -lwayland-client -lm -lpthread -flto -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+    endif
 endif
 
 # Directories
@@ -36,8 +52,25 @@ OBJDIR = $(BUILDDIR)/obj
 PROTOCOLDIR = protocols
 
 # Source files (including embedded assets which are now committed)
-SOURCES = $(shell find $(SRCDIR) -name "*.c")
+COMMON_SOURCES = \
+	$(SRCDIR)/core/main.c \
+	$(SRCDIR)/config/config.c \
+	$(SRCDIR)/graphics/animation.c \
+	$(SRCDIR)/graphics/embedded_assets.c \
+	$(SRCDIR)/utils/error.c \
+	$(SRCDIR)/utils/memory.c
+
+ifeq ($(UNAME_S),Darwin)
+    SOURCES = $(COMMON_SOURCES) $(SRCDIR)/config/config_watcher_macos.c
+    OBJC_SOURCES = $(SRCDIR)/platform/macos/macos_app.m $(SRCDIR)/platform/macos/input_macos.m
+    PROTOCOL_OBJECTS =
+else
+    SOURCES = $(shell find $(SRCDIR) -name "*.c" ! -name "config_watcher_macos.c")
+    OBJC_SOURCES =
+endif
+
 OBJECTS = $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+OBJC_OBJECTS = $(OBJC_SOURCES:$(SRCDIR)/%.m=$(OBJDIR)/%.o)
 
 # Embedded assets (now committed to git, use embed_assets.sh manually when assets change)
 EMBED_SCRIPT = scripts/embed_assets.sh
@@ -47,7 +80,9 @@ EMBEDDED_ASSETS_C = $(SRCDIR)/graphics/embedded_assets.c
 # Protocol files
 C_PROTOCOL_SRC = $(PROTOCOLDIR)/zwlr-layer-shell-v1-protocol.c $(PROTOCOLDIR)/xdg-shell-protocol.c $(PROTOCOLDIR)/wlr-foreign-toplevel-management-v1-protocol.c $(PROTOCOLDIR)/xdg-output-unstable-v1-protocol.c $(PROTOCOLDIR)/fractional-scale-v1-protocol.c $(PROTOCOLDIR)/viewporter-protocol.c
 H_PROTOCOL_HDR = $(PROTOCOLDIR)/zwlr-layer-shell-v1-client-protocol.h $(PROTOCOLDIR)/xdg-shell-client-protocol.h $(PROTOCOLDIR)/wlr-foreign-toplevel-management-v1-client-protocol.h $(PROTOCOLDIR)/xdg-output-unstable-v1-client-protocol.h $(PROTOCOLDIR)/fractional-scale-v1-client-protocol.h $(PROTOCOLDIR)/viewporter-client-protocol.h
+ifneq ($(UNAME_S),Darwin)
 PROTOCOL_OBJECTS = $(C_PROTOCOL_SRC:$(PROTOCOLDIR)/%.c=$(OBJDIR)/%.o)
+endif
 
 # Target executable
 TARGET = $(BUILDDIR)/bongocat
@@ -66,6 +101,7 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)/core
 	mkdir -p $(OBJDIR)/graphics
 	mkdir -p $(OBJDIR)/platform
+	mkdir -p $(OBJDIR)/platform/macos
 	mkdir -p $(OBJDIR)/config
 	mkdir -p $(OBJDIR)/utils
 	mkdir -p $(BUILDDIR)
@@ -74,12 +110,15 @@ $(OBJDIR):
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(OBJDIR)/%.o: $(SRCDIR)/%.m | $(OBJDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # Compile protocol files
 $(OBJDIR)/%.o: $(PROTOCOLDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TARGET): $(OBJECTS) $(PROTOCOL_OBJECTS)
-	$(CC) $(OBJECTS) $(PROTOCOL_OBJECTS) -o $(TARGET) $(LDFLAGS)
+$(TARGET): $(OBJECTS) $(OBJC_OBJECTS) $(PROTOCOL_OBJECTS)
+	$(CC) $(OBJECTS) $(OBJC_OBJECTS) $(PROTOCOL_OBJECTS) -o $(TARGET) $(LDFLAGS)
 
 # Regenerate Wayland protocol bindings from XML sources (requires wayland-scanner).
 # The generated files are committed to git, so this target only needs to be run
@@ -152,7 +191,7 @@ profile: release
 # =============================================================================
 
 # Find all project source files (exclude lib/ and protocols/)
-PROJECT_SOURCES = $(shell find $(SRCDIR) -name '*.c' ! -path '*/embedded_assets.c')
+PROJECT_SOURCES = $(shell find $(SRCDIR) \( -name '*.c' -o -name '*.m' \) ! -path '*/embedded_assets.c')
 PROJECT_HEADERS = $(shell find $(INCDIR) -name '*.h')
 ALL_PROJECT_FILES = $(PROJECT_SOURCES) $(PROJECT_HEADERS)
 

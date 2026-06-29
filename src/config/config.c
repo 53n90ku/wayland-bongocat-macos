@@ -9,11 +9,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/input.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
+
+#ifndef __APPLE__
+#  include <linux/input.h>
+#  include <sys/ioctl.h>
+#endif
 
 // =============================================================================
 // CONFIGURATION CONSTANTS AND VALIDATION RANGES
@@ -174,8 +177,8 @@ static bongocat_error_t config_expand_array(char ***array_ptr, int *count,
   return BONGOCAT_SUCCESS;
 }
 
-static bongocat_error_t config_add_keyboard_device(config_t *config,
-                                                   const char *device_path) {
+[[maybe_unused]] static bongocat_error_t
+config_add_keyboard_device(config_t *config, const char *device_path) {
   bongocat_error_t err = config_expand_array(
       &config->keyboard_devices, &config->num_keyboard_devices, device_path);
   if (err != BONGOCAT_SUCCESS) {
@@ -188,6 +191,10 @@ static bongocat_error_t config_add_keyboard_device(config_t *config,
 }
 
 static bongocat_error_t config_resolve_devices(config_t *config) {
+#ifdef __APPLE__
+  (void)config;
+  return BONGOCAT_SUCCESS;
+#else
   if (config->num_names == 0) {
     return BONGOCAT_SUCCESS;
   }
@@ -238,6 +245,7 @@ static bongocat_error_t config_resolve_devices(config_t *config) {
 
   closedir(dir);
   return BONGOCAT_SUCCESS;
+#endif
 }
 
 static void config_free_string_array(char ***array_ptr, int *count) {
@@ -468,8 +476,14 @@ config_parse_string_key(config_t *config, const char *key, const char *value) {
   if (strcmp(key, "monitor") == 0) {
     return config_parse_monitor_list(config, value);
   } else if (strcmp(key, "keyboard_name") == 0) {
+#if defined(__APPLE__) && !defined(TEST_BUILD)
+    bongocat_log_warning("keyboard_name is ignored on macOS; global keyboard "
+                         "events are used");
+    return BONGOCAT_SUCCESS;
+#else
     return config_expand_array(&config->keyboard_names, &config->num_names,
                                value);
+#endif
   } else {
     return BONGOCAT_ERROR_INVALID_PARAM;  // Unknown key
   }
@@ -500,6 +514,12 @@ config_parse_key_value(config_t *config, const char *key, const char *value) {
   // Handle device keys
   if (strcmp(key, "keyboard_device") == 0 ||
       strcmp(key, "keyboard_devices") == 0) {
+#if defined(__APPLE__) && !defined(TEST_BUILD)
+    (void)value;
+    bongocat_log_warning("keyboard_device is ignored on macOS; global "
+                         "keyboard events are used");
+    return BONGOCAT_SUCCESS;
+#else
     // Validate path starts with /dev/input/ and has no traversal
     if (strncmp(value, "/dev/input/", 11) != 0) {
       bongocat_log_warning(
@@ -511,6 +531,7 @@ config_parse_key_value(config_t *config, const char *key, const char *value) {
       return BONGOCAT_ERROR_INVALID_PARAM;
     }
     return config_add_keyboard_device(config, value);
+#endif
   }
 
   // Unknown key
@@ -691,11 +712,16 @@ static void config_set_defaults(config_t *config) {
 }
 
 static bongocat_error_t config_set_default_devices(config_t *config) {
+#if defined(__APPLE__) && !defined(TEST_BUILD)
+  (void)config;
+  return BONGOCAT_SUCCESS;
+#else
   if (config->num_keyboard_devices == 0) {
     const char *default_device = "/dev/input/event4";
     return config_add_keyboard_device(config, default_device);
   }
   return BONGOCAT_SUCCESS;
+#endif
 }
 
 static void config_finalize(config_t *config) {

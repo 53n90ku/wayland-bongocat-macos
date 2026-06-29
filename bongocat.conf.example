@@ -33,7 +33,7 @@ overlay_height=120
 overlay_opacity=0
 
 # Position: top, bottom
-overlay_position=bottom
+overlay_position=top
 
 # Layer: top (above windows), overlay (always visible, fullscreen auto-hide detection disabled)
 layer=top

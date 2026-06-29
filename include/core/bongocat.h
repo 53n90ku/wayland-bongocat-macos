@@ -3,7 +3,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/input.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -11,13 +10,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/inotify.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <wayland-client.h>
+
+#ifdef __APPLE__
+struct wl_output;
+struct zxdg_output_v1;
+#else
+#  include <linux/input.h>
+#  include <sys/inotify.h>
+#  include <sys/ioctl.h>
+#  include <sys/mman.h>
+#  include <wayland-client.h>
+#endif
 
 // =============================================================================
 // VERSION
@@ -48,8 +54,10 @@
 #define BONGOCAT_FRAME_SLEEPING   4
 
 // Inotify buffer sizing
-#define INOTIFY_EVENT_SIZE (sizeof(struct inotify_event))
-#define INOTIFY_BUF_LEN    (16 * (INOTIFY_EVENT_SIZE + 256))
+#ifndef __APPLE__
+#  define INOTIFY_EVENT_SIZE (sizeof(struct inotify_event))
+#  define INOTIFY_BUF_LEN    (16 * (INOTIFY_EVENT_SIZE + 256))
+#endif
 
 // =============================================================================
 // TYPE DEFINITIONS

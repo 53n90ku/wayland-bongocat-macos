@@ -1,14 +1,22 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#define _DARWIN_C_SOURCE
 #include "config/config.h"
 #include "core/bongocat.h"
+#ifndef __APPLE__
 #include "core/multi_monitor.h"
+#endif
 #include "graphics/animation.h"
 #include "platform/input.h"
+#ifdef __APPLE__
+#include "platform/macos.h"
+#else
 #include "platform/wayland.h"
+#endif
 #include "utils/error.h"
 #include "utils/memory.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -17,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -57,6 +66,10 @@ typedef struct {
   bool toggle_mode;
   bool show_help;
   bool show_version;
+#ifdef __APPLE__
+  bool install_launch_agent;
+  bool uninstall_launch_agent;
+#endif
 } cli_args_t;
 
 // =============================================================================
@@ -210,6 +223,261 @@ static int process_handle_toggle(void) {
 
   return 0;
 }
+
+#ifdef __APPLE__
+#define MACOS_LAUNCH_AGENT_LABEL "com.saatvik333.bongocat.overlay"
+
+static bool path_has_slash(const char *path) {
+  return path && strchr(path, '/') != NULL;
+}
+
+static bool resolve_executable_path(const char *argv0, char *out,
+                                    size_t out_size) {
+  if (!out || out_size == 0) {
+    return false;
+  }
+
+  if (path_has_slash(argv0)) {
+    if (realpath(argv0, out)) {
+      return true;
+    }
+    return false;
+  }
+
+  const char *path_env = getenv("PATH");
+  if (!path_env) {
+    return false;
+  }
+
+  char *path_copy = strdup(path_env);
+  if (!path_copy) {
+    return false;
+  }
+
+  bool found = false;
+  char *saveptr = NULL;
+  for (char *dir = strtok_r(path_copy, ":", &saveptr); dir;
+       dir = strtok_r(NULL, ":", &saveptr)) {
+    char candidate[PATH_MAX];
+    snprintf(candidate, sizeof(candidate), "%s/%s", dir, argv0);
+    if (access(candidate, X_OK) == 0 && realpath(candidate, out)) {
+      found = true;
+      break;
+    }
+  }
+
+  free(path_copy);
+  return found;
+}
+
+static char *resolve_absolute_path_or_copy(const char *path) {
+  if (!path) {
+    return NULL;
+  }
+
+  char resolved[PATH_MAX];
+  if (realpath(path, resolved)) {
+    return strdup(resolved);
+  }
+
+  return strdup(path);
+}
+
+static char *macos_launch_agent_path(void) {
+  const char *home = getenv("HOME");
+  if (!home || home[0] == '\0') {
+    return NULL;
+  }
+
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "%s/Library/LaunchAgents/%s.plist", home,
+           MACOS_LAUNCH_AGENT_LABEL);
+  return strdup(path);
+}
+
+static bool macos_ensure_launch_agents_dir(void) {
+  const char *home = getenv("HOME");
+  if (!home || home[0] == '\0') {
+    bongocat_log_error("HOME is not set; cannot install LaunchAgent");
+    return false;
+  }
+
+  char dir[PATH_MAX];
+  int len = snprintf(dir, sizeof(dir), "%s/Library/LaunchAgents", home);
+  if (len < 0 || (size_t)len >= sizeof(dir)) {
+    bongocat_log_error("LaunchAgents path is too long");
+    return false;
+  }
+
+  if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
+    bongocat_log_error("Failed to create %s: %s", dir, strerror(errno));
+    return false;
+  }
+
+  return true;
+}
+
+static void xml_write_escaped(FILE *file, const char *value) {
+  for (const unsigned char *p = (const unsigned char *)value; p && *p; p++) {
+    switch (*p) {
+    case '&':
+      fputs("&amp;", file);
+      break;
+    case '<':
+      fputs("&lt;", file);
+      break;
+    case '>':
+      fputs("&gt;", file);
+      break;
+    case '"':
+      fputs("&quot;", file);
+      break;
+    case '\'':
+      fputs("&apos;", file);
+      break;
+    default:
+      fputc(*p, file);
+      break;
+    }
+  }
+}
+
+static int macos_run_launchctl(char *const args[], bool log_errors) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    if (log_errors) {
+      bongocat_log_error("Failed to fork launchctl: %s", strerror(errno));
+    }
+    return -1;
+  }
+
+  if (pid == 0) {
+    execvp("launchctl", args);
+    _exit(127);
+  }
+
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) {
+    if (log_errors) {
+      bongocat_log_error("Failed to wait for launchctl: %s", strerror(errno));
+    }
+    return -1;
+  }
+
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  return -1;
+}
+
+static void macos_launch_agent_bootout(void) {
+  char service[128];
+  snprintf(service, sizeof(service), "gui/%d/%s", getuid(),
+           MACOS_LAUNCH_AGENT_LABEL);
+  char *args[] = {"launchctl", "bootout", service, NULL};
+  macos_run_launchctl(args, false);
+}
+
+static int macos_launch_agent_bootstrap(const char *plist_path) {
+  char domain[64];
+  snprintf(domain, sizeof(domain), "gui/%d", getuid());
+  char *args[] = {"launchctl", "bootstrap", domain, (char *)plist_path, NULL};
+  return macos_run_launchctl(args, true);
+}
+
+static int macos_install_launch_agent(const char *argv0,
+                                      const char *config_path) {
+  char executable_path[PATH_MAX];
+  if (!resolve_executable_path(argv0, executable_path,
+                               sizeof(executable_path))) {
+    bongocat_log_error("Could not resolve executable path for LaunchAgent");
+    return 1;
+  }
+
+  if (!macos_ensure_launch_agents_dir()) {
+    return 1;
+  }
+
+  char *plist_path = macos_launch_agent_path();
+  if (!plist_path) {
+    bongocat_log_error("Could not build LaunchAgent path");
+    return 1;
+  }
+
+  char *absolute_config = resolve_absolute_path_or_copy(config_path);
+  FILE *file = fopen(plist_path, "w");
+  if (!file) {
+    bongocat_log_error("Failed to write %s: %s", plist_path, strerror(errno));
+    free(absolute_config);
+    free(plist_path);
+    return 1;
+  }
+
+  fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", file);
+  fputs("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+        file);
+  fputs("<plist version=\"1.0\">\n<dict>\n", file);
+  fputs("  <key>Label</key>\n  <string>", file);
+  xml_write_escaped(file, MACOS_LAUNCH_AGENT_LABEL);
+  fputs("</string>\n", file);
+  fputs("  <key>ProgramArguments</key>\n  <array>\n", file);
+  fputs("    <string>", file);
+  xml_write_escaped(file, executable_path);
+  fputs("</string>\n", file);
+  if (absolute_config) {
+    fputs("    <string>-c</string>\n    <string>", file);
+    xml_write_escaped(file, absolute_config);
+    fputs("</string>\n", file);
+  }
+  fputs("    <string>-w</string>\n  </array>\n", file);
+  fputs("  <key>RunAtLoad</key>\n  <true/>\n", file);
+  fputs("  <key>KeepAlive</key>\n  <true/>\n", file);
+  fputs("  <key>ProcessType</key>\n  <string>Interactive</string>\n", file);
+  fputs("  <key>StandardOutPath</key>\n  "
+        "<string>/tmp/bongocat.out.log</string>\n",
+        file);
+  fputs("  <key>StandardErrorPath</key>\n  "
+        "<string>/tmp/bongocat.err.log</string>\n",
+        file);
+  fputs("</dict>\n</plist>\n", file);
+  fclose(file);
+
+  macos_launch_agent_bootout();
+  int bootstrap_result = macos_launch_agent_bootstrap(plist_path);
+  if (bootstrap_result != 0) {
+    bongocat_log_warning("LaunchAgent plist was written, but launchctl "
+                         "bootstrap returned %d",
+                         bootstrap_result);
+  }
+
+  bongocat_log_info("Installed LaunchAgent: %s", plist_path);
+  bongocat_log_info("It will start at login. Use Cmd+Shift+0 to hide/show.");
+
+  free(absolute_config);
+  free(plist_path);
+  return bootstrap_result == 0 ? 0 : 1;
+}
+
+static int macos_uninstall_launch_agent(void) {
+  char *plist_path = macos_launch_agent_path();
+  if (!plist_path) {
+    bongocat_log_error("Could not build LaunchAgent path");
+    return 1;
+  }
+
+  macos_launch_agent_bootout();
+  if (unlink(plist_path) < 0 && errno != ENOENT) {
+    bongocat_log_error("Failed to remove %s: %s", plist_path, strerror(errno));
+    free(plist_path);
+    return 1;
+  }
+
+  bongocat_log_info("Removed LaunchAgent: %s", plist_path);
+  free(plist_path);
+  return 0;
+}
+#endif
 
 // =============================================================================
 // SIGNAL HANDLING MODULE
@@ -424,7 +692,11 @@ static void config_reload_apply(const char *config_path) {
   pthread_mutex_unlock(&anim_lock);
 
   // Update the running systems with new config
+#ifdef __APPLE__
+  macos_app_update_config(&g_config);
+#else
   wayland_update_config(&g_config);
+#endif
 
   // Check if input devices changed and restart monitoring if needed
   if (devices_changed) {
@@ -463,7 +735,7 @@ static void config_process_pending_reload(void) {
   config_reload_apply(config_path);
 }
 
-static void wayland_tick_callback(void) {
+static void platform_tick_callback(void) {
   config_process_pending_reload();
 }
 
@@ -489,6 +761,14 @@ static bongocat_error_t config_setup_watcher(const char *config_file) {
 static bongocat_error_t system_initialize_components(void) {
   bongocat_error_t result;
 
+#ifdef __APPLE__
+  result = macos_app_init(&g_config);
+  if (result != BONGOCAT_SUCCESS) {
+    bongocat_log_error("Failed to initialize macOS overlay: %s",
+                       bongocat_error_string(result));
+    return result;
+  }
+#else
   // Initialize Wayland
   result = wayland_init(&g_config);
   if (result != BONGOCAT_SUCCESS) {
@@ -496,6 +776,7 @@ static bongocat_error_t system_initialize_components(void) {
                        bongocat_error_string(result));
     return result;
   }
+#endif
 
   // Initialize animation system
   result = animation_init(&g_config);
@@ -510,7 +791,11 @@ static bongocat_error_t system_initialize_components(void) {
   // pixel-perfect at any output scale; falls back to 1× if no scale event
   // has arrived yet.
   {
+#ifdef __APPLE__
+    int cat_h_phys = macos_phys_dim(g_config.cat_height);
+#else
     int cat_h_phys = wayland_phys_dim(g_config.cat_height);
+#endif
     int cat_w_phys = (cat_h_phys * CAT_IMAGE_WIDTH) / CAT_IMAGE_HEIGHT;
     animation_cache_frames(cat_w_phys, cat_h_phys, g_config.mirror_x,
                            g_config.mirror_y, g_config.enable_antialiasing);
@@ -556,8 +841,12 @@ _Noreturn static void system_cleanup_and_exit(int exit_code) {
   // Stop animation system
   animation_cleanup();
 
-  // Cleanup Wayland
+  // Cleanup platform backend
+#ifdef __APPLE__
+  macos_app_cleanup();
+#else
   wayland_cleanup();
+#endif
 
   // Cleanup input system
   input_cleanup();
@@ -599,6 +888,11 @@ static void cli_show_help(const char *program_name) {
   printf("  -t, --toggle          Toggle bongocat on/off (start if not "
          "running, stop if running)\n");
   printf("  -m, --monitor NAME    Bind to a specific monitor output\n");
+#ifdef __APPLE__
+  printf("      --install-launch-agent    Start bongocat at login\n");
+  printf("      --uninstall-launch-agent  Remove the login LaunchAgent\n");
+  printf("      Cmd+Shift+0 toggles the macOS overlay while it is running\n");
+#endif
   printf("\nConfiguration search order:\n");
   printf("  1. $XDG_CONFIG_HOME/bongocat/bongocat.conf\n");
   printf("  2. ~/.config/bongocat/bongocat.conf\n");
@@ -620,7 +914,13 @@ static int cli_parse_arguments(int argc, char *argv[], cli_args_t *args) {
                        .watch_config = false,
                        .toggle_mode = false,
                        .show_help = false,
-                       .show_version = false};
+                       .show_version = false
+#ifdef __APPLE__
+                       ,
+                       .install_launch_agent = false,
+                       .uninstall_launch_agent = false
+#endif
+  };
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -652,6 +952,12 @@ static int cli_parse_arguments(int argc, char *argv[], cli_args_t *args) {
       }
     } else if (strcmp(argv[i], "--multi-monitor-child") == 0) {
       args->multi_monitor_child = true;
+#ifdef __APPLE__
+    } else if (strcmp(argv[i], "--install-launch-agent") == 0) {
+      args->install_launch_agent = true;
+    } else if (strcmp(argv[i], "--uninstall-launch-agent") == 0) {
+      args->uninstall_launch_agent = true;
+#endif
     } else {
       bongocat_log_warning("Unknown argument: %s", argv[i]);
     }
@@ -696,6 +1002,30 @@ int main(int argc, char *argv[]) {
     cli_show_version();
     return 0;
   }
+
+#ifdef __APPLE__
+  if (args.install_launch_agent && args.uninstall_launch_agent) {
+    bongocat_log_error("--install-launch-agent and --uninstall-launch-agent "
+                       "cannot be used together");
+    return 1;
+  }
+
+  if (args.install_launch_agent || args.uninstall_launch_agent) {
+    if (args.multi_monitor_child) {
+      bongocat_log_error("LaunchAgent commands are not valid in child mode");
+      return 1;
+    }
+
+    if (args.uninstall_launch_agent) {
+      return macos_uninstall_launch_agent();
+    }
+
+    char *resolved_config = config_resolve_path(args.config_file);
+    int install_result = macos_install_launch_agent(argv[0], resolved_config);
+    free(resolved_config);
+    return install_result;
+  }
+#endif
 
   // Handle toggle mode
   if (args.toggle_mode && g_manage_pid_file) {
@@ -763,7 +1093,9 @@ int main(int argc, char *argv[]) {
       free(resolved_config);
       return 1;
     }
-  } else if (g_config.num_output_names > 1) {
+  }
+#ifndef __APPLE__
+  else if (g_config.num_output_names > 1) {
     // Parent process: launch one child per configured monitor
     bongocat_log_info("Multi-monitor mode enabled with %d configured monitors",
                       g_config.num_output_names);
@@ -782,6 +1114,12 @@ int main(int argc, char *argv[]) {
       return mm_result;
     }
   }
+#else
+  else if (g_config.num_output_names > 1) {
+    bongocat_log_info(
+        "macOS backend handles monitors in-process; skipping child fan-out");
+  }
+#endif
 
   // Initialize config watcher if requested
   if (args.watch_config) {
@@ -797,11 +1135,20 @@ int main(int argc, char *argv[]) {
 
   bongocat_log_info("Bongo Cat Overlay started successfully");
 
-  // Main Wayland event loop with graceful shutdown
-  wayland_set_tick_callback(wayland_tick_callback);
+  // Main platform event loop with graceful shutdown
+#ifdef __APPLE__
+  macos_app_set_tick_callback(platform_tick_callback);
+  result = macos_app_run(&running);
+#else
+  wayland_set_tick_callback(platform_tick_callback);
   result = wayland_run(&running);
+#endif
   if (result != BONGOCAT_SUCCESS) {
+#ifdef __APPLE__
+    bongocat_log_error("macOS event loop error: %s",
+#else
     bongocat_log_error("Wayland event loop error: %s",
+#endif
                        bongocat_error_string(result));
     system_cleanup_and_exit(1);
   }

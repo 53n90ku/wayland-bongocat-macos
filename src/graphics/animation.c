@@ -5,8 +5,13 @@
 
 #include "graphics/embedded_assets.h"
 #include "platform/input.h"
-#include "platform/wayland.h"
 #include "utils/memory.h"
+
+#ifdef __APPLE__
+#  include "platform/macos.h"
+#else
+#  include "platform/wayland.h"
+#endif
 
 #if defined(__GNUC__)
 #  pragma GCC diagnostic push
